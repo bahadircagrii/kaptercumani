@@ -1,17 +1,20 @@
+"""
+KAP Scraper
+-----------
+Doğru endpoint: https://www.kap.org.tr/tr/api/disclosures
+Yanıt yapısı:   her öğe { basic: { disclosureIndex, title, stockCodes, companyName, ... } }
+Yeni bildirimler için: ?afterDisclosureIndex=<son_index>
+"""
+
 import sqlite3
 import logging
 from pathlib import Path
-from contextlib import closing
-from datetime import datetime
 
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 logger = logging.getLogger(__name__)
 
 KAP_URL = "https://www.kap.org.tr/tr/api/disclosures"
-DISCLOSURE_DETAIL_URL = "https://www.kap.org.tr/tr/api/disclosure/{disc_id}"
 DB_PATH = Path(__file__).parent / "seen.db"
 
 HEADERS = {
@@ -21,35 +24,9 @@ HEADERS = {
         "Chrome/124.0.0.0 Safari/537.36"
     ),
     "Referer": "https://www.kap.org.tr/",
-    "Accept": "application/json, text/plain, */*",
-    "Origin": "https://www.kap.org.tr",
+    "Accept":  "application/json, text/plain, */*",
+    "Origin":  "https://www.kap.org.tr",
 }
-
-CONNECT_TIMEOUT = 10
-READ_TIMEOUT = 30
-
-
-def _build_session() -> requests.Session:
-    session = requests.Session()
-    session.headers.update(HEADERS)
-
-    retry = Retry(
-        total=3,
-        connect=3,
-        read=3,
-        backoff_factor=2,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=frozenset(["GET"]),
-        raise_on_status=False,
-    )
-
-    adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
-    return session
-
-
-SESSION = _build_session()
 
 
 def _get_conn() -> sqlite3.Connection:
@@ -74,14 +51,14 @@ def _get_conn() -> sqlite3.Connection:
     return conn
 
 
-def _get_max_index(conn: sqlite3.Connection) -> int:
+def _get_max_index(conn):
     row = conn.execute(
         "SELECT value FROM state WHERE key = 'max_disclosure_index'"
     ).fetchone()
-    return int(row[0]) if row and row[0].isdigit() else 0
+    return int(row[0]) if row else 0
 
 
-def _set_max_index(conn: sqlite3.Connection, idx: int) -> None:
+def _set_max_index(conn, idx):
     conn.execute(
         "INSERT OR REPLACE INTO state (key, value) VALUES ('max_disclosure_index', ?)",
         (str(idx),),
@@ -89,7 +66,8 @@ def _set_max_index(conn: sqlite3.Connection, idx: int) -> None:
     conn.commit()
 
 
-def _mark_seen(conn: sqlite3.Connection, disc_id: str) -> None:
+def _mark_seen(conn, disc_id):
+    from datetime import datetime
     conn.execute(
         "INSERT OR IGNORE INTO seen_disclosures (id, fetched_at) VALUES (?, ?)",
         (disc_id, datetime.utcnow().isoformat()),
@@ -97,7 +75,7 @@ def _mark_seen(conn: sqlite3.Connection, disc_id: str) -> None:
     conn.commit()
 
 
-def _is_seen(conn: sqlite3.Connection, disc_id: str) -> bool:
+def _is_seen(conn, disc_id):
     return bool(
         conn.execute(
             "SELECT 1 FROM seen_disclosures WHERE id = ?", (disc_id,)
@@ -105,122 +83,79 @@ def _is_seen(conn: sqlite3.Connection, disc_id: str) -> bool:
     )
 
 
-def _request_json(url: str):
-    try:
-        resp = SESSION.get(url, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
-        resp.raise_for_status()
-        return resp.json()
-    except requests.exceptions.ReadTimeout:
-        logger.error("KAP API read timeout: %s", url)
-    except requests.exceptions.ConnectTimeout:
-        logger.error("KAP API connect timeout: %s", url)
-    except requests.exceptions.HTTPError as exc:
-        status = exc.response.status_code if exc.response is not None else "?"
-        text = exc.response.text[:500] if exc.response is not None else ""
-        logger.error("KAP API HTTP hatasi (%s): %s | body=%s", status, url, text)
-    except requests.exceptions.RequestException as exc:
-        logger.error("KAP API baglanti hatasi: %s | url=%s", exc, url)
-    except ValueError as exc:
-        logger.error("KAP API JSON parse hatasi: %s | url=%s", exc, url)
-
-    return None
-
-
 def fetch_new_disclosures():
-    with closing(_get_conn()) as conn:
-        max_idx = _get_max_index(conn)
+    conn    = _get_conn()
+    max_idx = _get_max_index(conn)
 
-        url = KAP_URL if max_idx <= 0 else f"{KAP_URL}?afterDisclosureIndex={max_idx}"
-        items = _request_json(url)
+    url = KAP_URL
+    if max_idx > 0:
+        url = f"{KAP_URL}?afterDisclosureIndex={max_idx}"
 
-        if items is None:
-            return []
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=15)
+        resp.raise_for_status()
+        items = resp.json()
+    except Exception as exc:
+        logger.error("KAP API hatasi: %s", exc)
+        return []
 
-        if not isinstance(items, list) or not items:
-            logger.info("Yeni bildirim yok.")
-            return []
+    if not isinstance(items, list) or not items:
+        logger.info("Yeni bildirim yok.")
+        return []
 
-        # İlk çalışmada sadece son index'i kaydet
-        if max_idx == 0:
-            top_idx = 0
-            for item in items:
-                basic = item.get("basic", {})
-                idx = basic.get("disclosureIndex", 0)
-                if isinstance(idx, int):
-                    top_idx = max(top_idx, idx)
-                else:
-                    try:
-                        top_idx = max(top_idx, int(idx))
-                    except (TypeError, ValueError):
-                        pass
+    # İlk çalışmada sadece index kaydet
+    if max_idx == 0:
+        top_idx = items[0].get("basic", {}).get("disclosureIndex", 0)
+        _set_max_index(conn, top_idx)
+        logger.info(
+            "Ilk calisma: %d bildirim bulundu, index kaydedildi (%d). "
+            "Bir sonraki taramadan itibaren yeni bildirimler islenir.",
+            len(items), top_idx,
+        )
+        return []
 
-            if top_idx > 0:
-                _set_max_index(conn, top_idx)
+    new_disclosures = []
+    new_max = max_idx
 
-            logger.info(
-                "Ilk calisma: %d bildirim bulundu, index kaydedildi (%d). "
-                "Bir sonraki taramada sadece yeni bildirimler islenecek.",
-                len(items), top_idx,
-            )
-            return []
+    for item in items:
+        basic   = item.get("basic", {})
+        disc_id = str(basic.get("disclosureIndex", ""))
+        if not disc_id or _is_seen(conn, disc_id):
+            continue
 
-        new_disclosures = []
-        new_max = max_idx
+        stock_codes = basic.get("stockCodes") or []
+        ticker = (
+            stock_codes[0].get("code", "") if stock_codes else ""
+        ) or basic.get("companyCode", "")
+        ticker = ticker.upper()
 
-        for item in items:
-            basic = item.get("basic", {})
-            disclosure_index = basic.get("disclosureIndex")
+        title   = basic.get("title") or basic.get("disclosureSubject") or ""
+        pub_raw = basic.get("publishDate") or ""
 
-            try:
-                disclosure_index = int(disclosure_index)
-            except (TypeError, ValueError):
-                continue
+        new_disclosures.append({
+            "id":           disc_id,
+            "ticker":       ticker,
+            "title":        title,
+            "body_url":     f"https://www.kap.org.tr/tr/Bildirim/{disc_id}",
+            "published_at": pub_raw,
+            "raw":          basic,
+        })
+        _mark_seen(conn, disc_id)
+        new_max = max(new_max, int(disc_id))
 
-            disc_id = str(disclosure_index)
+    if new_max > max_idx:
+        _set_max_index(conn, new_max)
 
-            if _is_seen(conn, disc_id):
-                continue
-
-            stock_codes = basic.get("stockCodes") or []
-            ticker = (
-                stock_codes[0].get("code", "") if stock_codes else ""
-            ) or basic.get("companyCode", "")
-            ticker = ticker.upper().strip()
-
-            title = (basic.get("title") or basic.get("disclosureSubject") or "").strip()
-            pub_raw = basic.get("publishDate") or ""
-
-            new_disclosures.append(
-                {
-                    "id": disc_id,
-                    "ticker": ticker,
-                    "title": title,
-                    "body_url": f"https://www.kap.org.tr/tr/Bildirim/{disc_id}",
-                    "published_at": pub_raw,
-                    "raw": basic,
-                }
-            )
-
-            _mark_seen(conn, disc_id)
-            new_max = max(new_max, disclosure_index)
-
-        if new_max > max_idx:
-            _set_max_index(conn, new_max)
-
-        logger.info("%d yeni bildirim bulundu", len(new_disclosures))
-        return new_disclosures
+    logger.info("%d yeni bildirim bulundu", len(new_disclosures))
+    return new_disclosures
 
 
-def fetch_disclosure_text(disc_id: str) -> str:
-    url = DISCLOSURE_DETAIL_URL.format(disc_id=disc_id)
-    data = _request_json(url)
-
-    if not isinstance(data, dict):
+def fetch_disclosure_text(disc_id):
+    try:
+        url  = f"https://www.kap.org.tr/tr/api/disclosure/{disc_id}"
+        resp = requests.get(url, headers=HEADERS, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("content") or data.get("text") or data.get("body") or ""
+    except Exception:
         return ""
-
-    return (
-        data.get("content")
-        or data.get("text")
-        or data.get("body")
-        or ""
-    )
