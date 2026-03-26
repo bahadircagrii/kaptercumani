@@ -1,45 +1,49 @@
 """
 KAP Scraper
 -----------
-KAP'ın genel erişime açık JSON uç noktalarından bildirimleri çeker.
-Hiç kayıt kaçırılmaması için SQLite'ta görülen bildirimler saklanır.
+Doğru endpoint: https://www.kap.org.tr/tr/api/disclosures
+Yanıt yapısı:   her öğe { basic: { disclosureIndex, title, stockCodes, companyName, ... } }
+Yeni bildirimler için: ?afterDisclosureIndex=<son_index>
 """
 
 import sqlite3
 import logging
-from datetime import datetime, timedelta
 from pathlib import Path
 
 import requests
 
 logger = logging.getLogger(__name__)
 
-KAP_DISCLOSURE_URL = "https://www.kap.org.tr/tr/api/memberNotificationQuery"
+KAP_URL = "https://www.kap.org.tr/tr/api/disclosures"
 DB_PATH = Path(__file__).parent / "seen.db"
 
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
+        "Chrome/124.0.0.0 Safari/537.36"
     ),
     "Referer": "https://www.kap.org.tr/",
-    "Accept": "application/json, text/plain, */*",
-    "Origin": "https://www.kap.org.tr",
+    "Accept":  "application/json, text/plain, */*",
+    "Origin":  "https://www.kap.org.tr",
 }
 
 
-# ---------------------------------------------------------------------------
-# Veritabanı
-# ---------------------------------------------------------------------------
-
-def _init_db() -> sqlite3.Connection:
+def _get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS seen_disclosures (
-            id          TEXT PRIMARY KEY,
-            fetched_at  TEXT NOT NULL
+            id         TEXT PRIMARY KEY,
+            fetched_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS state (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
         )
         """
     )
@@ -47,14 +51,23 @@ def _init_db() -> sqlite3.Connection:
     return conn
 
 
-def _is_seen(conn: sqlite3.Connection, disc_id: str) -> bool:
+def _get_max_index(conn):
     row = conn.execute(
-        "SELECT 1 FROM seen_disclosures WHERE id = ?", (disc_id,)
+        "SELECT value FROM state WHERE key = 'max_disclosure_index'"
     ).fetchone()
-    return row is not None
+    return int(row[0]) if row else 0
 
 
-def _mark_seen(conn: sqlite3.Connection, disc_id: str) -> None:
+def _set_max_index(conn, idx):
+    conn.execute(
+        "INSERT OR REPLACE INTO state (key, value) VALUES ('max_disclosure_index', ?)",
+        (str(idx),),
+    )
+    conn.commit()
+
+
+def _mark_seen(conn, disc_id):
+    from datetime import datetime
     conn.execute(
         "INSERT OR IGNORE INTO seen_disclosures (id, fetched_at) VALUES (?, ?)",
         (disc_id, datetime.utcnow().isoformat()),
@@ -62,86 +75,87 @@ def _mark_seen(conn: sqlite3.Connection, disc_id: str) -> None:
     conn.commit()
 
 
-# ---------------------------------------------------------------------------
-# Ana çekici
-# ---------------------------------------------------------------------------
+def _is_seen(conn, disc_id):
+    return bool(
+        conn.execute(
+            "SELECT 1 FROM seen_disclosures WHERE id = ?", (disc_id,)
+        ).fetchone()
+    )
 
-def fetch_new_disclosures() -> list[dict]:
-    """
-    KAP'tan son bildirimleri çeker, daha önce görülmüş olanları filtreler.
-    Her bildirim dict şu anahtarları taşır:
-        id, ticker, title, body_url, published_at, raw
-    """
-    conn = _init_db()
 
-    # KAP API'si POST + JSON body bekliyor
-    today = datetime.now().strftime("%Y-%m-%d")
-    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+def fetch_new_disclosures():
+    conn    = _get_conn()
+    max_idx = _get_max_index(conn)
 
-    payload = {
-        "fromDate": yesterday,
-        "toDate":   today,
-        "term":     "",
-    }
+    url = KAP_URL
+    if max_idx > 0:
+        url = f"{KAP_URL}?afterDisclosureIndex={max_idx}"
 
     try:
-        resp = requests.post(
-            KAP_DISCLOSURE_URL,
-            json=payload,
-            headers=HEADERS,
-            timeout=15,
-        )
+        resp = requests.get(url, headers=HEADERS, timeout=15)
         resp.raise_for_status()
-        data = resp.json()
+        items = resp.json()
     except Exception as exc:
-        logger.error("KAP API hatası: %s", exc)
+        logger.error("KAP API hatasi: %s", exc)
         return []
 
-    # API bazen liste, bazen {"data": [...]} döndürebilir
-    items = data if isinstance(data, list) else data.get("data", [])
+    if not isinstance(items, list) or not items:
+        logger.info("Yeni bildirim yok.")
+        return []
+
+    # İlk çalışmada sadece index kaydet
+    if max_idx == 0:
+        top_idx = items[0].get("basic", {}).get("disclosureIndex", 0)
+        _set_max_index(conn, top_idx)
+        logger.info(
+            "Ilk calisma: %d bildirim bulundu, index kaydedildi (%d). "
+            "Bir sonraki taramadan itibaren yeni bildirimler islenir.",
+            len(items), top_idx,
+        )
+        return []
 
     new_disclosures = []
+    new_max = max_idx
+
     for item in items:
-        disc_id = str(item.get("id") or item.get("disclosureIndex", ""))
-        if not disc_id:
-            continue
-        if _is_seen(conn, disc_id):
+        basic   = item.get("basic", {})
+        disc_id = str(basic.get("disclosureIndex", ""))
+        if not disc_id or _is_seen(conn, disc_id):
             continue
 
-        # Alan adları KAP'ın döndürdüğü JSON'a göre ayarla
-        ticker  = (item.get("memberCode") or item.get("ticker") or "").upper()
-        title   = item.get("title") or item.get("header") or ""
-        pub_raw = item.get("publishDate") or item.get("publishedAt") or ""
+        stock_codes = basic.get("stockCodes") or []
+        ticker = (
+            stock_codes[0].get("code", "") if stock_codes else ""
+        ) or basic.get("companyCode", "")
+        ticker = ticker.upper()
 
-        new_disclosures.append(
-            {
-                "id":           disc_id,
-                "ticker":       ticker,
-                "title":        title,
-                "body_url":     f"https://www.kap.org.tr/tr/Bildirim/{disc_id}",
-                "published_at": pub_raw,
-                "raw":          item,
-            }
-        )
+        title   = basic.get("title") or basic.get("disclosureSubject") or ""
+        pub_raw = basic.get("publishDate") or ""
+
+        new_disclosures.append({
+            "id":           disc_id,
+            "ticker":       ticker,
+            "title":        title,
+            "body_url":     f"https://www.kap.org.tr/tr/Bildirim/{disc_id}",
+            "published_at": pub_raw,
+            "raw":          basic,
+        })
         _mark_seen(conn, disc_id)
+        new_max = max(new_max, int(disc_id))
+
+    if new_max > max_idx:
+        _set_max_index(conn, new_max)
 
     logger.info("%d yeni bildirim bulundu", len(new_disclosures))
     return new_disclosures
 
 
-def fetch_disclosure_text(disc_id: str) -> str:
-    """Bildirim detay sayfasından metni çekmeye çalışır."""
+def fetch_disclosure_text(disc_id):
     try:
-        url  = f"https://www.kap.org.tr/tr/api/memberNotification/{disc_id}"
+        url  = f"https://www.kap.org.tr/tr/api/disclosure/{disc_id}"
         resp = requests.get(url, headers=HEADERS, timeout=10)
         resp.raise_for_status()
         data = resp.json()
-        # Metin content / text / body alanından gelebilir
-        return (
-            data.get("content")
-            or data.get("text")
-            or data.get("body")
-            or ""
-        )
+        return data.get("content") or data.get("text") or data.get("body") or ""
     except Exception:
         return ""
