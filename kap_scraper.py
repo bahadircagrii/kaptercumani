@@ -6,6 +6,15 @@ import requests
 
 logger  = logging.getLogger(__name__)
 KAP_URL = "https://www.kap.org.tr/tr/api/disclosures"
+
+import os
+SCRAPERAPI_KEY = os.getenv("SCRAPERAPI_KEY", "")
+
+def _scraper_url(url):
+    if SCRAPERAPI_KEY:
+        return f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={url}"
+    return url
+
 DB_PATH = Path(__file__).parent / "seen.db"
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
@@ -44,7 +53,7 @@ def _get_with_retry(url, retries=3, timeout=30):
     """Timeout olursa 3 kez dener."""
     for attempt in range(retries):
         try:
-            resp = requests.get(url, headers=HEADERS, timeout=timeout)
+            resp = requests.get(_scraper_url(url), timeout=timeout)
             resp.raise_for_status()
             return resp
         except requests.exceptions.Timeout:
