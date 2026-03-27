@@ -21,7 +21,7 @@ HEADERS = {
 def _scraper_url(url):
     if SCRAPERAPI_KEY:
         logger.info("ScraperAPI uzerinden istek: %s", url)
-        return f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={requests.utils.quote(url, safe='')}"
+        return f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={requests.utils.quote(url, safe='')}&country_code=tr&render=false"
     logger.warning("SCRAPERAPI_KEY bulunamadi, direkt istek yapiliyor.")
     return url
 
