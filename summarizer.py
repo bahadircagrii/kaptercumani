@@ -1,9 +1,3 @@
-"""
-Özetleyici (Claude API)
------------------------
-Bildirimi alır, insan diliyle yazılmış taslak post üretir.
-"""
-
 import logging
 import anthropic
 from config import ANTHROPIC_API_KEY
@@ -15,30 +9,41 @@ SYSTEM_PROMPT = """\
 Sen KAP Radar adlı bir sosyal medya hesabı için çalışıyorsun.
 Görevin: Türkiye Sermaye Piyasası (KAP) bildirimlerini sıradan yatırımcıların anlayacağı sade Türkçeye çevirmek.
 
-KURAL:
-- Yatırım tavsiyesi verme.
-- Clickbait yapma. "UÇACAK", "BOMBA", "YIKILDIK" gibi ifadeleri kesinlikle kullanma.
-- Abartmadan, sakin ve net bir ton kullan.
-- Bildirimde tutar/rakam belirtilmemişse "tutar açıklanmadı" veya "oran henüz bilinmiyor" gibi bir not düş.
-- Etki etiketi için sadece şu 5 seçenekten birini kullan:
-  "Olumlu" | "Hafif olumlu" | "Nötr" | "Hafif olumsuz" | "Kritik"
+KATEGORİ REHBERİ (etki etiketine karar verirken kullan):
+- temettü: nakit çıkışı var, tutar ve verim önemli → genellikle olumlu
+- geri_alim: şirket hissesini ucuz buluyor sinyali → olumlu
+- sermaye_artirimi: bedelsiz nötr, bedelli seyreltici → dikkatli değerlendir
+- sozlesme: tutar belirtilmişse büyüklüğe göre değerlendir, belirsizse "hafif olumlu"
+- finansal_sonuc: rakamları beklentiyle karşılaştır, varsa yorumla
+- yatirim: uzun vadeli olumlu ama kısa vadede nakit çıkışı
+- tahvil_borc: ödeme yapıldıysa nötr; gecikme/temerrüt varsa KRİTİK
+- yonetim_degisikligi: ani ayrılış olumsuz, yeni atama nötr/bekle
+- hukuki: SPK/BDDK cezası, dava, kayyum → olumsuz/kritik
+- insider: yönetici alımı olumlu sinyal; satışı izle
+- birlesme_devralma: en sert fiyat hareketi yaratan kategori → KRİTİK
+- kredi_derecelendirme: not artışı olumlu, indirimi kritik
+- operasyonel_risk: grev/kaza/yangın → olumsuz, büyüklüğe göre kritik
+- lisans_ruhsat: iptal kritik, genişleme olumlu
 
-ÇIKTI FORMATI (tam olarak bu yapıyı kullan, başka açıklama ekleme):
-[Ticker] – [Bildirim konusu özeti]
+KURALLAR:
+- Yatırım tavsiyesi verme.
+- "UÇACAK", "BOMBA", "YIKILDIK" gibi ifade kullanma.
+- Sakin, net, abartısız ton.
+- Rakam/tutar belirtilmemişse bunu mutlaka belirt.
+- Temerrüt, kayyum, iflas, SPK cezası gibi ciddi gelişmelerde etiketi "Kritik" yap.
+
+ÇIKTI FORMATI (sadece bu yapı, başka açıklama ekleme):
+[Ticker] – [Konu özeti]
 Ne oldu? [1 cümle]
-Bu ne demek? [2-3 cümle insan dili açıklama]
-Neye bakmalı? [1-2 cümle yatırımcı sorusu]
-Etki: [etiket]
+Bu ne demek? [2-3 cümle]
+Neye bakmalı? [1-2 cümle]
+Etki: [Olumlu / Hafif olumlu / Nötr / Hafif olumsuz / Kritik]
 Kaynak: KAP bildirimi
 Yatırım tavsiyesi değildir.\
 """
 
 
 def generate_post(disclosure: dict, body_text: str = "") -> dict:
-    """
-    Bildirim için taslak post üretir.
-    Dönen dict: {'post_text': str, 'label': str}
-    """
     ticker   = disclosure.get("ticker", "?")
     title    = disclosure.get("title", "")
     category = disclosure.get("category", "")
@@ -52,7 +57,6 @@ def generate_post(disclosure: dict, body_text: str = "") -> dict:
         f"Varsayılan etki: {def_lbl}\n"
     )
     if body_text:
-        # Çok uzunsa kırp
         user_msg += f"\nBildirim metni (ilk 800 karakter):\n{body_text[:800]}\n"
     user_msg += f"\nKAP linki: {url}\n\nYukarıdaki formatta taslak post yaz."
 
@@ -65,8 +69,7 @@ def generate_post(disclosure: dict, body_text: str = "") -> dict:
         )
         post_text = response.content[0].text.strip()
     except Exception as exc:
-        logger.error("Claude API hatası: %s", exc)
-        # Fallback: basit şablon
+        logger.error("Claude API hatasi: %s", exc)
         post_text = (
             f"{ticker} – {title}\n"
             f"Ne oldu? KAP'ta yeni bildirim açıklandı.\n"
@@ -75,7 +78,6 @@ def generate_post(disclosure: dict, body_text: str = "") -> dict:
             f"Yatırım tavsiyesi değildir."
         )
 
-    # Etki etiketini metinden çıkar
     label = def_lbl
     for line in post_text.splitlines():
         if line.startswith("Etki:"):
