@@ -1,3 +1,4 @@
+import os
 import sqlite3
 import logging
 import time
@@ -6,22 +7,23 @@ import requests
 
 logger  = logging.getLogger(__name__)
 KAP_URL = "https://www.kap.org.tr/tr/api/disclosures"
-
-import os
+DB_PATH = Path(__file__).parent / "seen.db"
 SCRAPERAPI_KEY = os.getenv("SCRAPERAPI_KEY", "")
 
-def _scraper_url(url):
-    if SCRAPERAPI_KEY:
-        return f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={url}"
-    return url
-
-DB_PATH = Path(__file__).parent / "seen.db"
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
     "Referer": "https://www.kap.org.tr/",
     "Accept":  "application/json, text/plain, */*",
     "Origin":  "https://www.kap.org.tr",
 }
+
+
+def _scraper_url(url):
+    if SCRAPERAPI_KEY:
+        logger.info("ScraperAPI uzerinden istek: %s", url)
+        return f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={requests.utils.quote(url, safe='')}"
+    logger.warning("SCRAPERAPI_KEY bulunamadi, direkt istek yapiliyor.")
+    return url
 
 
 def _get_conn():
@@ -49,22 +51,22 @@ def _is_seen(conn, disc_id):
     return bool(conn.execute("SELECT 1 FROM seen_disclosures WHERE id=?", (disc_id,)).fetchone())
 
 
-def _get_with_retry(url, retries=3, timeout=30):
-    """Timeout olursa 3 kez dener."""
+def _get_with_retry(url, retries=3, timeout=60):
+    final_url = _scraper_url(url)
     for attempt in range(retries):
         try:
-            resp = requests.get(_scraper_url(url), timeout=timeout)
+            resp = requests.get(final_url, timeout=timeout)
             resp.raise_for_status()
             return resp
         except requests.exceptions.Timeout:
-            wait = (attempt + 1) * 10
-            logger.warning("KAP timeout (deneme %d/%d). %d sn bekleniyor...", attempt+1, retries, wait)
+            wait = (attempt + 1) * 15
+            logger.warning("Timeout (deneme %d/%d). %d sn bekleniyor...", attempt+1, retries, wait)
             if attempt < retries - 1:
                 time.sleep(wait)
         except Exception as exc:
-            logger.error("KAP hatasi: %s", exc)
+            logger.error("Istek hatasi: %s", exc)
             return None
-    logger.error("KAP %d denemede de yanit vermedi.", retries)
+    logger.error("%d denemede de yanit alinamadi.", retries)
     return None
 
 
@@ -79,8 +81,8 @@ def fetch_new_disclosures():
 
     try:
         items = resp.json()
-    except Exception:
-        logger.error("JSON parse hatasi")
+    except Exception as e:
+        logger.error("JSON parse hatasi: %s | Yanit: %s", e, resp.text[:200])
         return []
 
     if not isinstance(items, list) or not items:
@@ -90,7 +92,7 @@ def fetch_new_disclosures():
     if max_idx == 0:
         top_idx = items[0].get("basic", {}).get("disclosureIndex", 0)
         _set_max_index(conn, top_idx)
-        logger.info("Ilk calisma: index kaydedildi (%d). Sonraki taramadan itibaren bildirimler islenir.", top_idx)
+        logger.info("Ilk calisma: index kaydedildi (%d). Sonraki taramadan bildirimler islenir.", top_idx)
         return []
 
     new_disclosures = []
@@ -120,7 +122,7 @@ def fetch_new_disclosures():
 
 
 def fetch_disclosure_text(disc_id):
-    resp = _get_with_retry(f"https://www.kap.org.tr/tr/api/disclosure/{disc_id}", retries=2, timeout=20)
+    resp = _get_with_retry(f"https://www.kap.org.tr/tr/api/disclosure/{disc_id}", retries=2, timeout=30)
     if resp is None:
         return ""
     try:
