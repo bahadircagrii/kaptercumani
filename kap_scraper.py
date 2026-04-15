@@ -4,15 +4,24 @@ import logging
 import time
 from pathlib import Path
 from datetime import datetime
+from urllib.parse import quote
 import requests
 from bs4 import BeautifulSoup
 
 logger  = logging.getLogger(__name__)
 DB_PATH = Path(os.getenv("DB_PATH", str(Path(__file__).parent / "seen.db")))
 
+SCRAPERAPI_KEY = os.getenv("SCRAPERAPI_KEY", "")
+
+def _scraper_url(url):
+    """ScraperAPI proxy URL'si oluştur (KAP'ın IP engelini aşmak için)."""
+    if SCRAPERAPI_KEY:
+        return f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={quote(url, safe='')}"
+    return url
+
 # KAP'ın herkese açık bildirim listesi (HTML sayfa)
 KAP_LIST_URL = "https://www.kap.org.tr/tr/bildirim-sorgu"
-# Yeni bildirimler JSON endpoint (daha basit, deneyelim)
+# Yeni bildirimler JSON endpoint
 KAP_API_URL  = "https://www.kap.org.tr/tr/api/disclosures"
 
 HEADERS = {
@@ -58,10 +67,12 @@ def _try_api(max_idx):
     """Önce JSON API'yi dene."""
     url = KAP_API_URL if max_idx == 0 else f"{KAP_API_URL}?afterDisclosureIndex={max_idx}"
     try:
-        # Önce ana sayfayı ziyaret et (cookie al)
-        SESSION.get("https://www.kap.org.tr/tr", timeout=20)
-        time.sleep(1)
-        resp = SESSION.get(url, headers=API_HEADERS, timeout=30)
+        if SCRAPERAPI_KEY:
+            resp = requests.get(_scraper_url(url), timeout=30)
+        else:
+            SESSION.get("https://www.kap.org.tr/tr", timeout=20)
+            time.sleep(1)
+            resp = SESSION.get(url, headers=API_HEADERS, timeout=30)
         resp.raise_for_status()
         data = resp.json()
         if isinstance(data, list):
@@ -75,20 +86,21 @@ def _try_api(max_idx):
 def _try_html():
     """API çalışmazsa HTML sayfasını parse et."""
     try:
-        SESSION.get("https://www.kap.org.tr/tr", timeout=20)
-        time.sleep(1)
-        resp = SESSION.get(KAP_LIST_URL, timeout=30)
+        if SCRAPERAPI_KEY:
+            resp = requests.get(_scraper_url(KAP_LIST_URL), timeout=30)
+        else:
+            SESSION.get("https://www.kap.org.tr/tr", timeout=20)
+            time.sleep(1)
+            resp = SESSION.get(KAP_LIST_URL, timeout=30)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
 
         results = []
-        # KAP bildirim tablosunu bul
         rows = soup.select("table tbody tr") or soup.select(".notification-row") or soup.select("[class*='disclosure']")
         for row in rows[:50]:
             cols = row.find_all("td")
             if len(cols) < 3:
                 continue
-            # Link varsa disclosure ID'yi çıkar
             link = row.find("a", href=True)
             if not link:
                 continue
@@ -120,7 +132,6 @@ def fetch_new_disclosures():
     conn    = _get_conn()
     max_idx = _get_max_index(conn)
 
-    # Önce API dene, olmadı HTML'e geç
     items = _try_api(max_idx)
     if items is None:
         items = _try_html()
@@ -166,10 +177,11 @@ def fetch_new_disclosures():
 
 def fetch_disclosure_text(disc_id):
     try:
-        resp = SESSION.get(
-            f"https://www.kap.org.tr/tr/api/disclosure/{disc_id}",
-            headers=API_HEADERS, timeout=20
-        )
+        url = f"https://www.kap.org.tr/tr/api/disclosure/{disc_id}"
+        if SCRAPERAPI_KEY:
+            resp = requests.get(_scraper_url(url), timeout=20)
+        else:
+            resp = SESSION.get(url, headers=API_HEADERS, timeout=20)
         data = resp.json()
         return data.get("content") or data.get("text") or data.get("body") or ""
     except Exception:
